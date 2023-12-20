@@ -6,10 +6,16 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"net/http"
+	"os"
+	"encoding/json"
+	"time"
+	"strconv" 
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	// "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azsecrets"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 )
 
 type client struct {
@@ -19,12 +25,68 @@ type client struct {
 	vaultClients map[string]*azsecrets.Client
 }
 
+type accessToken azcore.AccessToken
+
+func (a accessToken) GetToken(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken(a), nil
+}
+
 // New returns a client that fetches secrets from Azure Key Vault.
 func New() (*client, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to obtain a credential: %w", err)
+	// Get environment variables
+	identityHeader := os.Getenv("IDENTITY_HEADER")
+	identityEndpoint := os.Getenv("IDENTITY_ENDPOINT")
+
+	// Check if environment variables are defined
+	if identityHeader == "" || identityEndpoint == "" {
+		return nil, fmt.Errorf("IDENTITY_HEADER or IDENTITY_ENDPOINT is not defined.")
 	}
+
+	// Create HTTP request
+	url := fmt.Sprintf("%s?resource=https://vault.azure.net&api-version=2019-08-01", identityEndpoint)
+	req, err := http.NewRequest("GET", url, nil)
+	req.Header.Set("x-identity-header", identityHeader)
+	reqClient := &http.Client{}
+	resp, err := reqClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Can not get managed identity token:", err)
+	}
+	defer resp.Body.Close()
+
+	// Get access token
+	var responseBody map[string]interface{}
+	err = json.NewDecoder(resp.Body).Decode(&responseBody)
+	if err != nil {
+		return nil, fmt.Errorf("Error when parsing JSON response:", err)
+	}
+	accessTokenResp, ok := responseBody["access_token"].(string)
+	if !ok {
+		return nil, fmt.Errorf("Access token is missing")
+	}
+	expTimeResp, ok := responseBody["expires_on"].(string)
+	if !ok {
+		return nil, fmt.Errorf("Expiration time is missing")
+	}
+	expiresOnUnix, err := strconv.ParseInt(expTimeResp, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("Error when converting expires_on in int64:", err)
+	}
+	expiresOn := time.Unix(expiresOnUnix, 0)
+
+	// Create azcore.TokenCredential with access token
+	cred := accessToken(azcore.AccessToken{
+		Token:     accessTokenResp,
+		ExpiresOn: expiresOn,
+	})
+
+	var _ azcore.TokenCredential = cred
+
+	// var cred azcore.TokenCredential
+	// cred, err := azidentity.NewDefaultAzureCredential(nil)
+
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to obtain a credential: %w", err)
+	// }
 
 	return &client{
 		credential:   cred,
